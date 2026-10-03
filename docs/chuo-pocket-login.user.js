@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chuo Pocket Login
 // @description  自分のGmailから新しいCampusSquare認証番号を読み、大学公式フォームへ入力する補助
-// @version      1.0.0
+// @version      1.1.0
 // @match        https://portal.cs.chuo-u.ac.jp/campusweb/*
 // @match        https://mail.google.com/mail/u/*
 // @inject-into  content
@@ -30,21 +30,27 @@ const ChuoAuthState=(()=>{const module={exports:{}};
       Number.isInteger(c.accountIndex) && c.accountIndex >= 0 && c.accountIndex <= 9;
   }
   function validJob(j, now) {
-    return j && j.version === 1 && /^[a-f0-9]{32}$/.test(j.nonce) && PHASES.has(j.phase) &&
+    if (!(j && j.version === 1 && /^[a-f0-9]{32}$/.test(j.nonce) && PHASES.has(j.phase) &&
       Number.isSafeInteger(j.createdAt) && Number.isSafeInteger(j.expiresAt) && j.createdAt <= now &&
-      j.expiresAt > now && j.expiresAt - j.createdAt <= 600000 && /^[a-f0-9]{64}$/.test(j.ownerHash);
+      j.expiresAt > now && /^[a-f0-9]{64}$/.test(j.ownerHash) && /^[a-f0-9]{64}$/.test(j.configHash))) return false;
+    if (['prepare','prepared'].includes(j.phase)) return j.expiresAt - j.createdAt <= 600000;
+    if (['requested','ready'].includes(j.phase)) return Number.isSafeInteger(j.requestStartedAt) &&
+      j.requestStartedAt >= j.createdAt && j.requestStartedAt <= now && j.requestStartedAt - j.createdAt < 600000 &&
+      j.expiresAt > j.requestStartedAt && j.expiresAt - j.requestStartedAt <= 300000;
+    return j.expiresAt - j.createdAt <= 900000;
   }
   function canConsume(j, ownerHash, now) {
     return validJob(j, now) && j.phase === 'ready' && j.ownerHash === ownerHash &&
       typeof j.code === 'string' && /^\d{6}$/.test(j.code) && Number.isSafeInteger(j.requestStartedAt) &&
       j.requestStartedAt >= j.createdAt && j.requestStartedAt <= now && now - j.requestStartedAt <= 300000 &&
+      Number.isSafeInteger(j.receivedAt) && j.receivedAt >= j.requestStartedAt && j.receivedAt <= now + 15000 && now - j.receivedAt <= 300000 &&
       Array.isArray(j.messageIds) && j.messageIds.length > 0;
   }
   function consumed(j, now) {
     if (!canConsume(j,j.ownerHash,now)) throw new Error('AUTH_EXPIRED');
     // New object: the code and message body never survive consumption.
     return {version:1,nonce:j.nonce,phase:'consumed',createdAt:j.createdAt,expiresAt:j.expiresAt,
-      ownerHash:j.ownerHash,inputHash:j.inputHash||null,consumedAt:now};
+      ownerHash:j.ownerHash,inputHash:j.inputHash||null,configHash:j.configHash||null,consumedAt:now};
   }
   return {validConfig:validConfig,validJob:validJob,canConsume:canConsume,consumed:consumed};
 });
@@ -173,7 +179,7 @@ const ChuoGmailDOM=(()=>{const module={exports:{}};
         if (!validKeys(supplied) || (supplied.length && observedKeys.length && !intersects(supplied, observedKeys))) return { status: 'thread-mismatch', messages: [], identityKeys: [], threadKeys: [] };
         // A caller may bind keys from the inbox row it just opened when Gmail omits them in the open-thread DOM.
         var keys = supplied.length ? supplied : observedKeys;
-        if (!keys.length) return { status: 'thread-id-missing', messages: [], identityKeys: [], threadKeys: [] };
+        if (!keys.length && options.forOriginalVerification !== true) return { status: 'thread-id-missing', messages: [], identityKeys: [], threadKeys: [] };
         var allIds = [], messages = [], seenBodies = new Set();
         list(scope.querySelectorAll('[data-message-id], [data-legacy-message-id]')).forEach(function (container) {
             if (inBody(container, scope)) return;
@@ -258,6 +264,33 @@ const ChuoGmailDOM=(()=>{const module={exports:{}};
         return eligible.length === 1 ? Object.assign(eligible[0], { diagnostics: diagnostics }) : { status: 'not-found', diagnostics: diagnostics };
     }
 
+    // A candidate is never proof of freshness. Only the bound Gmail original's
+    // Google Received timestamp and Authentication-Results can make it ready.
+    // This also supports Gmail's observed open-message DOM without thread IDs.
+    function selectOtpCandidate(capture, config, options) {
+        var settings = rules(config); options = options || {};
+        var start = options.requestStartedAt, now = options.now === undefined ? Date.now() : options.now;
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(now) || start <= 0 || start > now) fail('INVALID_CHALLENGE_TIME');
+        if (!capture || capture.status !== 'captured' || !Array.isArray(capture.messages)) return {status:'not-ready'};
+        var baseline = options.baseline || {}, excluded = new Set(Array.isArray(baseline.identityKeys) ? baseline.identityKeys : []);
+        var used = options.usedMessageIds || new Set();
+        if (!(used instanceof Set)) fail('INVALID_USED_IDS');
+        var eligible = [], unreadable = false;
+        capture.messages.forEach(function(message) {
+            if (message.sender !== settings.expectedSender || message.subject !== settings.expectedSubject || !Array.isArray(message.identityKeys) || !message.identityKeys.length) return;
+            if (used.has(message.id) || message.identityKeys.some(function(key){return excluded.has(key) || used.has(key);})) return;
+            var interval = message.receivedInterval;
+            if (!interval || interval.precision !== 'minute' || interval.timeZone !== 'Asia/Tokyo' || !Number.isSafeInteger(interval.startMs) || interval.endMs !== interval.startMs + 60000 || interval.endMs <= start || interval.startMs > now + 15000 || now - interval.endMs > 300000) return;
+            var ids = unique(message.identityKeys.map(function(key){var match=/^data-message-id:#?(msg-f:\d+)$/.exec(key);return match && match[1];}).filter(Boolean));
+            if (ids.length !== 1 || message.captureError || typeof message.bodyText !== 'string') {unreadable = true;return;}
+            var codes = extractCodes(message.bodyText);
+            if (codes.size !== 1) {unreadable = true;return;}
+            eligible.push({status:'candidate',messageId:message.id,permMessageId:ids[0],identityKeys:message.identityKeys.slice(),code:Array.from(codes)[0]});
+        });
+        if (eligible.length > 1 || unreadable) return {status:'manual-required',reason:eligible.length>1?'multiple-new-messages':'unreadable-new-message'};
+        return eligible.length === 1 ? eligible[0] : {status:'not-found'};
+    }
+
     function verifySignaturePopup(popup, config) {
         config = config || {};
         var domain = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,63}$/i;
@@ -278,7 +311,224 @@ const ChuoGmailDOM=(()=>{const module={exports:{}};
     }
     return { parseJstMinuteTitle: parseJstMinuteTitle, captureInboxCandidates: captureInboxCandidates,
         captureOpenThread: captureOpenThread, createThreadBaseline: createThreadBaseline,
-        selectFreshOtp: selectFreshOtp, verifySignaturePopup: verifySignaturePopup };
+        selectFreshOtp: selectFreshOtp, selectOtpCandidate: selectOtpCandidate, verifySignaturePopup: verifySignaturePopup };
+});
+
+return module.exports;})();
+const ChuoGmailOriginal=(()=>{const module={exports:{}};
+(function (root, factory) {
+    'use strict';
+    if (typeof module === 'object' && module.exports) module.exports = factory();
+    else root.ChuoGmailOriginal = factory();
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+    'use strict';
+    // This is a deliberately narrow parser for Gmail's observed original-message UI,
+    // not an RFC mail client. Unsupported syntax stops verification.
+    // RFC 5322: https://www.rfc-editor.org/rfc/rfc5322#section-3.3
+    // RFC 8601: https://www.rfc-editor.org/rfc/rfc8601#section-1.2
+    var MAILBOX = /^[a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/i;
+    var DOMAIN = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/i;
+    var MESSAGE = /^msg-f:[A-Za-z0-9_:-]{1,160}$/;
+    var MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    var WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+    var RAW_LIMIT = 1_048_576, HEADER_LIMIT = 65_536;
+    var MAX_AGE = 300_000, FUTURE_SKEW = 15_000;
+    function rejected(reason) { return { status: 'rejected', reason: reason }; }
+    function trim(value) { return String(value || '').trim(); }
+
+    function visible(element) {
+        var view = element.ownerDocument && element.ownerDocument.defaultView;
+        for (var node = element; node; node = node.parentElement) {
+            if (node.hidden || node.hasAttribute('hidden') || node.getAttribute('aria-hidden') === 'true') return false;
+            if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|opacity\s*:\s*0)\s*(?:!important)?\s*(?:;|$)/i.test(node.getAttribute('style') || '')) return false;
+            if (view && typeof view.getComputedStyle === 'function') {
+                var style = view.getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
+            }
+        }
+        return true;
+    }
+
+    // Remove RFC comments while preserving quoted values. Escapes and nested
+    // comments are bounded; an unclosed comment or quote is rejected.
+    function withoutComments(value) {
+        var out = '', depth = 0, quoted = false, escaped = false;
+        for (var char of value) {
+            if (escaped) { if (!depth) out += char; escaped = false; continue; }
+            if (char === '\\' && (depth || quoted)) { if (!depth) out += char; escaped = true; continue; }
+            if (depth) {
+                if (char === '(' && ++depth > 10) return null;
+                if (char === ')') depth--;
+                continue;
+            }
+            if (char === '"') { quoted = !quoted; out += char; continue; }
+            if (!quoted && char === '(') { depth = 1; out += ' '; continue; }
+            if (!quoted && char === ')') return null;
+            out += char;
+        }
+        return depth || quoted || escaped ? null : out;
+    }
+
+    function segments(value) {
+        var clean = withoutComments(value);
+        if (clean === null) return null;
+        var parts = [], current = '', quoted = false, escaped = false;
+        for (var char of clean) {
+            if (escaped) { current += char; escaped = false; continue; }
+            if (char === '\\' && quoted) { current += char; escaped = true; continue; }
+            if (char === '"') quoted = !quoted;
+            if (char === ';' && !quoted) { parts.push(current.trim()); current = ''; }
+            else current += char;
+        }
+        parts.push(current.trim());
+        return parts;
+    }
+
+    function headers(raw) {
+        if (typeof raw !== 'string' || raw.length > RAW_LIMIT) return { error: 'original-too-large' };
+        // Never parse anything beyond the first blank line, including attached or
+        // body-authored Received/Authentication-Results/From lookalikes.
+        var prefix = raw.slice(0, HEADER_LIMIT + 4);
+        var boundary = /\r?\n\r?\n/.exec(prefix);
+        if (!boundary) return { error: raw.length > HEADER_LIMIT ? 'headers-too-large' : 'headers-incomplete' };
+        if (boundary.index > HEADER_LIMIT) return { error: 'headers-too-large' };
+        var text = prefix.slice(0, boundary.index).replace(/\r\n/g, '\n');
+        if (/[\x00-\x08\x0B-\x1F\x7F]/.test(text)) return { error: 'headers-malformed' };
+        var lines = text.split('\n');
+        if (!lines.length || lines.length > 1_000) return { error: 'headers-too-large' };
+        var fields = [], current = null;
+        for (var line of lines) {
+            if (line.length > 998) return { error: 'headers-too-large' };
+            if (/^[ \t]/.test(line)) {
+                if (!current) return { error: 'headers-malformed' };
+                current.value += line; // RFC unfold removes CRLF, retaining WSP.
+                continue;
+            }
+            var match = /^([A-Za-z0-9-]+):(.*)$/.exec(line);
+            if (!match) return { error: 'headers-malformed' };
+            current = { name: match[1].toLowerCase(), value: match[2].trim() };
+            fields.push(current);
+        }
+        return { fields: fields };
+    }
+    function values(fields, name) { return fields.filter(function (field) { return field.name === name; }).map(function (field) { return field.value; }); }
+
+    function mailbox(value, displayNameAllowed) {
+        var clean = withoutComments(value);
+        if (clean === null) return null;
+        clean = clean.trim();
+        if (MAILBOX.test(clean)) return clean.toLowerCase();
+        if (!displayNameAllowed) return null;
+        var match = /^(?:(?:"(?:[^"\\]|\\.)*"|[^<>,"]+)\s*)?<\s*([^<>]+?)\s*>$/.exec(clean);
+        return match && MAILBOX.test(match[1]) ? match[1].toLowerCase() : null;
+    }
+
+    function receivedTime(value) {
+        var parts = segments(value);
+        if (!parts || parts.length < 2 || !parts[0]) return null;
+        var dateText = parts[parts.length - 1].replace(/[ \t]+/g, ' ').trim();
+        var match = /^(?:(Mon|Tue|Wed|Thu|Fri|Sat|Sun), )?(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$/i.exec(dateText);
+        if (!match) return null;
+        var day = Number(match[2]), month = MONTHS.indexOf(match[3].toLowerCase()), year = Number(match[4]);
+        var hour = Number(match[5]), minute = Number(match[6]), second = Number(match[7]);
+        var zoneHour = Number(match[9]), zoneMinute = Number(match[10]);
+        // Unknown-local-zone -0000, obsolete named zones, minute-only dates and
+        // leap-second syntax are unsupported rather than silently normalised.
+        if (year < 1900 || year > 2100 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59 || zoneHour > 23 || zoneMinute > 59 || (match[8] === '-' && zoneHour === 0 && zoneMinute === 0)) return null;
+        var calendar = new Date(Date.UTC(year, month, day));
+        if (calendar.getUTCFullYear() !== year || calendar.getUTCMonth() !== month || calendar.getUTCDate() !== day || (match[1] && WEEKDAYS[calendar.getUTCDay()] !== match[1].toLowerCase())) return null;
+        var offset = (zoneHour * 60 + zoneMinute) * 60_000 * (match[8] === '+' ? 1 : -1);
+        var timestamp = Date.UTC(year, month, day, hour, minute, second) - offset;
+        return Number.isSafeInteger(timestamp) && Date.parse(dateText) === timestamp ? timestamp : null;
+    }
+
+    // Authentication-Results property values may be quoted. Tokenising prevents
+    // an attacker-controlled reason="header.i=..." from acting as a real property.
+    function properties(clause) {
+        var pairs = [], cursor = 0;
+        while (cursor < clause.length) {
+            while (/[ \t]/.test(clause[cursor] || '') && cursor < clause.length) cursor++;
+            if (cursor === clause.length) break;
+            var key = /^[A-Za-z][A-Za-z0-9_.-]*/.exec(clause.slice(cursor));
+            if (!key || pairs.length > 100) return null;
+            cursor += key[0].length;
+            while (/[ \t]/.test(clause[cursor] || '') && cursor < clause.length) cursor++;
+            if (clause[cursor++] !== '=') return null;
+            while (/[ \t]/.test(clause[cursor] || '') && cursor < clause.length) cursor++;
+            var value = '';
+            if (clause[cursor] === '"') {
+                cursor++;
+                var closed = false;
+                while (cursor < clause.length) {
+                    var char = clause[cursor++];
+                    if (char === '"') { closed = true; break; }
+                    if (char === '\\') { if (cursor >= clause.length) return null; char = clause[cursor++]; }
+                    value += char;
+                }
+                if (!closed || (cursor < clause.length && !/[ \t]/.test(clause[cursor]))) return null;
+            } else {
+                var atom = /^[^ \t"]+/.exec(clause.slice(cursor));
+                if (!atom) return null;
+                value = atom[0]; cursor += atom[0].length;
+            }
+            pairs.push({ key: key[0].toLowerCase(), value: value });
+        }
+        return pairs;
+    }
+
+    function authenticated(value, domain) {
+        var parts = segments(value);
+        if (!parts || !/^mx\.google\.com(?:\s+[0-9]+)?$/i.test(parts[0])) return false;
+        var universityPasses = 0;
+        for (var clause of parts.slice(1)) {
+            if (!/^dkim\s*=/i.test(clause)) continue;
+            var pairs = properties(clause);
+            if (!pairs || pairs[0].key !== 'dkim' || pairs[0].value.toLowerCase() !== 'pass') continue;
+            var identities = pairs.filter(function (pair) { return pair.key === 'header.i'; });
+            var domains = pairs.filter(function (pair) { return pair.key === 'header.d'; });
+            if (identities.length !== 1 || domains.length > 1) continue;
+            var identity = identities[0].value.toLowerCase();
+            var at = identity.lastIndexOf('@');
+            if (at < 0 || identity.indexOf('@') !== at || identity.slice(at + 1) !== domain || /[\s<>]/.test(identity)) continue;
+            if (domains.length && domains[0].value.toLowerCase() !== domain) continue;
+            universityPasses++;
+        }
+        return universityPasses === 1;
+    }
+
+    function inspectOriginal(doc, location, config, options) {
+        config = config || {}; options = options || {};
+        var email = trim(config.expectedEmail).toLowerCase();
+        var sender = trim(config.expectedSender || 'no-reply@cs.chuo-u.ac.jp').toLowerCase();
+        var signing = trim(config.expectedSigningDomain || 'cs.chuo-u.ac.jp').toLowerCase();
+        var index = config.expectedAccountIndex === undefined ? 0 : config.expectedAccountIndex;
+        var start = options.requestStartedAt, now = options.now === undefined ? Date.now() : options.now;
+        if (!MAILBOX.test(email) || !MAILBOX.test(sender) || !DOMAIN.test(signing) || !Number.isSafeInteger(index) || index < 0 || index > 99 || !MESSAGE.test(options.expectedPermMessageId || '')) return rejected('configuration-invalid');
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(now) || start <= 0 || start > now) return rejected('challenge-time-invalid');
+        try {
+            var url = new URL(typeof location === 'string' ? location : location && location.href);
+            if (url.protocol !== 'https:' || url.hostname !== 'mail.google.com' || url.port || url.username || url.password || url.pathname !== '/mail/u/' + index + '/' || url.hash || url.searchParams.getAll('view').length !== 1 || url.searchParams.get('view') !== 'om' || url.searchParams.getAll('permmsgid').length !== 1 || url.searchParams.get('permmsgid') !== options.expectedPermMessageId || url.searchParams.getAll('ik').length > 1) return rejected('original-url-mismatch');
+            if (!doc || typeof doc.querySelectorAll !== 'function') return rejected('original-unavailable');
+            var sources = Array.from(doc.querySelectorAll('pre#raw_message_text.raw_message_text')).filter(function (pre) { return visible(pre) && !(pre.closest && pre.closest('.a3s')); });
+            if (sources.length !== 1) return rejected(sources.length ? 'original-ambiguous' : 'original-unavailable');
+            var parsed = headers(sources[0].textContent);
+            if (parsed.error) return rejected(parsed.error);
+            var from = values(parsed.fields, 'from'), delivered = values(parsed.fields, 'delivered-to'), received = values(parsed.fields, 'received'), auth = values(parsed.fields, 'authentication-results');
+            if (from.length !== 1 || mailbox(from[0], true) !== sender) return rejected('sender-mismatch');
+            if (!delivered.length || mailbox(delivered[0], false) !== email) return rejected('recipient-mismatch');
+            if (!auth.length || !authenticated(auth[0], signing)) return rejected('authentication-unverified');
+            var receivedAt = received.length ? receivedTime(received[0]) : null;
+            if (receivedAt === null) return rejected('received-time-invalid');
+            if (receivedAt < start) return rejected('received-before-challenge');
+            if (now - receivedAt > MAX_AGE) return rejected('received-too-old');
+            if (receivedAt - now > FUTURE_SKEW) return rejected('received-in-future');
+            // Do not return message IDs, account addresses, raw mail, codes or URLs.
+            return { status: 'verified', receivedAt: receivedAt };
+        } catch (_) {
+            return rejected('original-unavailable');
+        }
+    }
+    return { inspectOriginal: inspectOriginal };
 });
 
 return module.exports;})();
@@ -503,11 +753,11 @@ return module.exports;})();
   if (window.top !== window || !['portal.cs.chuo-u.ac.jp','mail.google.com'].includes(location.hostname)) return;
   const KEY_CONFIG='config-v1',KEY_JOB='login-job-v1',KEY_USED='used-mail-ids-v1';
   const RULES={expectedSender:'no-reply@cs.chuo-u.ac.jp',expectedSubject:'【CampusSquare】ワンタイムパスワードのお知らせ'};
-  const SIGNATURE={expectedSenderDomain:'cs.chuo-u.ac.jp',expectedSigningDomain:'cs.chuo-u.ac.jp'};
   const adapter=ChuoOTPAdapter.createAdapter(ChuoCampusSquareOTPManifest);
   const State=ChuoAuthState;
-  if (typeof GM==='undefined' || !['getValue','setValue','deleteValue','openInTab','getTab','saveTab'].every(k=>typeof GM[k]==='function')) return;
-  let busy=false,config=await GM.getValue(KEY_CONFIG,null),owner=null,openedKeys=null,signature=null,signaturePending=null;
+  if (typeof GM==='undefined' || !['getValue','setValue','deleteValue','openInTab','getTab','saveTab','closeTab','addStyle'].every(k=>typeof GM[k]==='function')) return;
+  let busy=false,config=await GM.getValue(KEY_CONFIG,null),owner=null,contextNonce=null,contextURL=null,originalMenuPending=null,openedOriginalId=null;
+  function resetMailContext(){originalMenuPending=null;openedOriginalId=null;contextURL=null;}
   const panel=document.createElement('section');panel.id='chuo-pocket-login';panel.setAttribute('aria-label','中大ポケットのログイン補助');
   panel.innerHTML='<strong>中大ポケット</strong><p class="cp-status" role="status"></p><div class="cp-actions"></div><details><summary>メール連携の設定</summary><label>大学に登録したGmail<input type="email" class="cp-email" autocomplete="email"></label><label>Gmailのアカウント番号<input type="number" class="cp-index" min="0" max="9" value="0"></label><button type="button" class="cp-save">設定をこのiPhoneに保存</button><button type="button" class="cp-clear">連携設定を消す</button><p>番号はGmailのURLの /u/0/ の数字です。メール本文や大学パスワードは保存しません。</p></details>';
   document.body.append(panel);
@@ -516,24 +766,26 @@ return module.exports;})();
   function actions(list){const area=panel.querySelector('.cp-actions');area.replaceChildren();for(const [text,fn]of list){const b=document.createElement('button');b.type='button';b.textContent=text;b.onclick=()=>perform(fn);area.append(b);}}
   async function perform(fn){if(busy)return;busy=true;try{await fn();}catch(_){say('処理を完了できませんでした。設定と公式画面を確認してください。保存した授業データは残っています。');}finally{busy=false;}}
   if(State.validConfig(config)){panel.querySelector('.cp-email').value=config.email;panel.querySelector('.cp-index').value=config.accountIndex;}
-  panel.querySelector('.cp-save').onclick=()=>perform(async()=>{const c={version:1,email:panel.querySelector('.cp-email').value.trim().toLowerCase(),accountIndex:Number(panel.querySelector('.cp-index').value)};if(!State.validConfig(c)){say('Gmailアドレスと0〜9のアカウント番号を確認してください。');return;}await GM.setValue(KEY_CONFIG,c);config=c;say('設定を保存しました。Safariを閉じても次回に引き継ぎます。');await tick();});
-  panel.querySelector('.cp-clear').onclick=()=>perform(async()=>{await GM.deleteValue(KEY_JOB);await GM.deleteValue(KEY_CONFIG);await GM.deleteValue(KEY_USED);config=null;panel.querySelector('.cp-email').value='';say('連携設定を消しました。授業データは残っています。');});
+  panel.querySelector('.cp-save').onclick=()=>perform(async()=>{const c={version:1,email:panel.querySelector('.cp-email').value.trim().toLowerCase(),accountIndex:Number(panel.querySelector('.cp-index').value)};if(!State.validConfig(c)){say('Gmailアドレスと0〜9のアカウント番号を確認してください。');return;}const old=await GM.getValue(KEY_CONFIG,null);if(!State.validConfig(old)||old.email.toLowerCase()!==c.email||old.accountIndex!==c.accountIndex){await GM.deleteValue(KEY_JOB);resetMailContext();}await GM.setValue(KEY_CONFIG,c);config=c;say('設定を保存しました。Safariを閉じても次回に引き継ぎます。');await tick();});
+  panel.querySelector('.cp-clear').onclick=()=>perform(async()=>{await GM.deleteValue(KEY_JOB);await GM.deleteValue(KEY_CONFIG);await GM.deleteValue(KEY_USED);config=null;resetMailContext();actions([]);panel.querySelector('.cp-email').value='';say('連携設定を消しました。授業データは残っています。');});
   const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).display!=='none'&&getComputedStyle(e).visibility!=='hidden';
   const random=()=>Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,'0')).join('');
   async function hash(text){const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));return Array.from(new Uint8Array(bytes),x=>x.toString(16).padStart(2,'0')).join('');}
   async function flowHash(form){const keys=Array.from(form.querySelectorAll('input[type="hidden"][name="_flowExecutionKey"]'));if(keys.length!==1||!keys[0].value)throw Error('FLOW_MISSING');return hash(location.origin+location.pathname+'\n'+keys[0].value);}
-  async function job(){const j=await GM.getValue(KEY_JOB,null);if(j&&!State.validJob(j,Date.now())){await GM.deleteValue(KEY_JOB);return null;}return j;}
+  async function configHash(c){return State.validConfig(c)?hash(c.email.toLowerCase()+'\n'+c.accountIndex):null;}
+  async function job(){const j=await GM.getValue(KEY_JOB,null);const currentConfig=await GM.getValue(KEY_CONFIG,null);if(j&&(!State.validJob(j,Date.now())||j.configHash!==await configHash(currentConfig))){await GM.deleteValue(KEY_JOB);contextNonce=null;resetMailContext();return null;}if((j?.nonce||null)!==contextNonce){contextNonce=j?.nonce||null;resetMailContext();}return j;}
   async function update(j,phase,fields={}){const current=await job();if(!current||current.nonce!==j.nonce||current.phase!==j.phase)return false;const next={...j,...fields,phase};await GM.setValue(KEY_JOB,next);return next;}
   async function openMail(){if(!State.validConfig(config))return;const query='from:'+RULES.expectedSender+' subject:ワンタイムパスワード';await GM.openInTab('https://mail.google.com/mail/u/'+config.accountIndex+'/#search/'+encodeURIComponent(query),false);}
   function sendStage(){if(location.pathname!=='/campusweb/campussquare.do')return null;const forms=Array.from(document.forms).filter(f=>{const a=new URL(f.getAttribute('action')||location.href,location.href);return (f.method||'').toLowerCase()==='post'&&a.origin===location.origin&&a.pathname===location.pathname&&Array.from(f.querySelectorAll('h3')).some(h=>visible(h)&&h.textContent.trim()==='ワンタイムパスワード認証を行います。')&&f.querySelectorAll('input[type="submit"][name="_eventId_send"][value="送信"]').length===1;});if(forms.length!==1)return null;const form=forms[0],button=form.querySelector('input[type="submit"][name="_eventId_send"]');if(!visible(button)||button.disabled||Array.from(document.querySelectorAll('input[type="password"]')).some(visible)||button.hasAttribute('formaction')||button.hasAttribute('formmethod'))return null;return{form,button};}
-  async function start(){const s=sendStage();if(!s||!State.validConfig(config)){say('公式のメール送信画面を開き、Gmail設定を保存してください。');return;}const existing=await job();if(existing&&!['failed','consumed'].includes(existing.phase)){say('進行中の認証があります。再開するか中止してください。');return;}owner=random();await GM.saveTab({chuoOwner:owner});const now=Date.now();const j={version:1,nonce:random(),phase:'prepare',createdAt:now,expiresAt:now+600000,ownerHash:await hash(owner),sendHash:await flowHash(s.form)};await GM.setValue(KEY_JOB,j);await openMail();}
+  async function start(){const s=sendStage();if(!s||!State.validConfig(config)){say('公式のメール送信画面を開き、Gmail設定を保存してください。');return;}const existing=await job();if(existing&&!['failed','consumed'].includes(existing.phase)){say('進行中の認証があります。再開するか中止してください。');return;}owner=random();await GM.saveTab({chuoOwner:owner});const now=Date.now();const j={version:1,nonce:random(),phase:'prepare',createdAt:now,expiresAt:now+600000,ownerHash:await hash(owner),sendHash:await flowHash(s.form),configHash:await configHash(config)};await GM.setValue(KEY_JOB,j);await openMail();}
   async function cancel(){await GM.deleteValue(KEY_JOB);say('認証の進行状況を消しました。新しく開始できます。');}
   async function campusTick(){const j=await job(),s=sendStage(),isInput=adapter.inspectPage(document,location).ok;
     if(!State.validConfig(config)){say('初回だけGmailの連携設定を保存してください。');actions([]);return;}
     if(!j){say(s?'公式メールを送る前に、ログイン補助を開始してください。':isInput?'すでにメールを送信済みです。公式画面で入力するか、メール送信画面から補助を開始してください。':'大学のログイン状態を利用できます。期限切れの場合は公式ログイン画面へ進んでください。');actions(s?[['Gmailで自動認証を開始',start]]:[]);return;}
     const tab=await GM.getTab();owner=tab&&tab.chuoOwner||owner;
-    let mine=owner&&await hash(owner)===j.ownerHash;
-    if(!mine&&isInput&&j.inputHash&&await flowHash(document.querySelector('#otpInputForm'))===j.inputHash){mine=true;}
+    let mine=(owner&&await hash(owner)===j.ownerHash)||(tab&&tab.chuoOwnerHash===j.ownerHash&&tab.chuoNonce===j.nonce);
+    if(!mine&&s&&['prepare','prepared'].includes(j.phase)&&await flowHash(s.form)===j.sendHash){mine=true;await GM.saveTab({chuoOwnerHash:j.ownerHash,chuoNonce:j.nonce});}
+    if(!mine&&isInput&&j.inputHash&&await flowHash(document.querySelector('#otpInputForm'))===j.inputHash){mine=true;await GM.saveTab({chuoOwnerHash:j.ownerHash,chuoNonce:j.nonce});}
     if(!mine){say('別の画面で認証が進行中です。開始した大学のタブに戻ってください。');actions([['認証を中止',cancel]]);return;}
     if(j.phase==='prepare'){say('Gmailで過去の認証メールを確認しています。Gmailを前面で開いてください。');actions([['Gmailを開く',openMail],['認証を中止',cancel]]);return;}
     if(j.phase==='prepared'&&s){if(await flowHash(s.form)!==j.sendHash){say('公式画面が変わりました。認証を中止して開始し直してください。');actions([['認証を中止',cancel]]);return;}const now=Date.now();const next=await update(j,'requested',{requestStartedAt:now,expiresAt:now+300000});if(next){say('大学から認証メールを送信しています。');s.button.click();}return;}
@@ -547,24 +799,51 @@ return module.exports;})();
     if(j.phase==='consumed'){say(isInput?'認証番号を送信済みです。公式画面の結果を確認してください。':'大学の画面を利用できます。連携設定は次回へ引き継ぎます。');actions([['進行状況を片付ける',cancel]]);return;}
     say('認証の途中です。開始した公式画面に戻ってください。');actions([['認証を中止',cancel]]);
   }
-  function matchingAccount(){const labels=Array.from(document.querySelectorAll('a[aria-label^="Google アカウント"],a[aria-label^="Google Account"]')).filter(visible).map(e=>e.getAttribute('aria-label')||'');return State.validConfig(config)&&labels.length===1&&(labels[0].toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}/g)||[]).includes(config.email);}
+  function matchingAccount(){const labels=Array.from(document.querySelectorAll('a[aria-label^="Google アカウント"],a[aria-label^="Google Account"]')).filter(visible).map(e=>e.getAttribute('aria-label')||'');return State.validConfig(config)&&labels.length===1&&(labels[0].toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}/g)||[]).includes(config.email.toLowerCase());}
   function messageElement(ids){const all=Array.from(document.querySelectorAll('[data-message-id], [data-legacy-message-id]'));return all.find(e=>visible(e)&&['data-message-id','data-legacy-message-id'].some(k=>ids.includes(k+':'+e.getAttribute(k))));}
-  function detailsTables(){return Array.from(document.querySelectorAll('table.ajC')).filter(visible);}
-  async function gmailTick(){const j=await job();if(!j||!['prepare','requested'].includes(j.phase)){say('Gmailの連携設定は保存されています。認証はCampusSquareのメール送信画面から開始してください。');actions([]);return;}
-    if(!matchingAccount()){say('設定したGmailアカウントで開いてください。Safariでデスクトップ用Webサイトを表示すると対応画面になります。');actions([]);return;}
-    let capture=ChuoGmailDOM.captureOpenThread(document,RULES,{threadKeys:openedKeys||j.baseline&&j.baseline.threadKeys||[]});
-    if(capture.status!=='captured'){const inbox=ChuoGmailDOM.captureInboxCandidates(document,RULES);const candidates=inbox.candidates.sort((a,b)=>b.receivedInterval.startMs-a.receivedInterval.startMs);if(!candidates.length){say('CampusSquareの認証メールの検索結果を開いてください。初回の過去メールがない場合は一度公式画面で認証してください。');return;}const chosen=candidates[0];const row=Array.from(document.querySelectorAll('[role="row"]')).find(r=>visible(r)&&Array.from(r.querySelectorAll('[data-thread-id],[data-legacy-thread-id]')).some(e=>['data-thread-id','data-legacy-thread-id'].some(k=>chosen.threadKeys.includes(k+':'+e.getAttribute(k)))));if(!row)return;openedKeys=chosen.threadKeys;row.click();say('CampusSquareの認証メールだけを確認しています。');return;}
-    if(j.phase==='prepare'){const baseline=ChuoGmailDOM.createThreadBaseline(capture,Date.now());if(await update(j,'prepared',{baseline})){say('過去メールを記録しました。CampusSquareのタブに戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);}return;}
-    const found=ChuoGmailDOM.selectFreshOtp(capture,RULES,{baseline:j.baseline,requestStartedAt:j.requestStartedAt,usedMessageIds:new Set(await GM.getValue(KEY_USED,[])),now:Date.now()});
-    if(found.status!=='found'){say(found.status==='ambiguous'||found.status==='manual-required'?'新しい認証メールを一意に確認できません。公式画面で確認してください。':'認証メールの到着を待っています。このGmail画面を前面にしておいてください。');return;}
-    const element=messageElement(found.identityKeys);if(!element)return;
-    if(signature&&signature.messageId===found.messageId&&Date.now()-signature.checkedAt<30000){const fresh=await job();if(!fresh||fresh.nonce!==j.nonce||fresh.phase!=='requested')return;const next=await update(fresh,'ready',{code:found.code,messageIds:found.identityKeys,codeCapturedAt:Date.now()});if(next){say('新しい認証番号を取得しました。CampusSquareへ戻ると公式フォームに入力・送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);}return;}
-    if(signaturePending&&signaturePending.messageId===found.messageId){const tables=detailsTables().filter(t=>!signaturePending.existing.has(t));if(tables.length===1&&ChuoGmailDOM.verifySignaturePopup(tables[0],SIGNATURE).status==='verified'){signature={messageId:found.messageId,checkedAt:Date.now()};signaturePending=null;return;}if(Date.now()-signaturePending.startedAt>10000){signaturePending=null;say('送信元の署名を確認できません。メールの詳細を閉じて再確認してください。');}return;}
-    const buttons=Array.from(element.querySelectorAll('[role="button"].ajy')).filter(b=>visible(b)&&['詳細を表示','Show details'].includes(b.getAttribute('aria-label')));if(buttons.length!==1)return;
-    const existing=new Set(detailsTables());if(existing.size){say('メールの詳細を一度閉じてください。新しいメールの署名を照合します。');return;}
-    signaturePending={messageId:found.messageId,existing,startedAt:Date.now()};buttons[0].click();
+  async function originalTick(){
+    const j=await job(),p=j&&j.originalPending;
+    if(j&&j.phase==='ready'){say('受信時刻と大学の署名を確認しました。この原文タブを閉じ、CampusSquareへ戻ってください。');actions([['この原文タブを閉じる',()=>GM.closeTab()]]);return;}
+    if(!j||j.phase!=='requested'||!p){say('この原文は進行中の認証と結び付いていません。CampusSquareから開始してください。');actions([]);return;}
+    const verified=ChuoGmailOriginal.inspectOriginal(document,location,{expectedEmail:config.email,expectedAccountIndex:config.accountIndex},{expectedPermMessageId:p.permMessageId,requestStartedAt:j.requestStartedAt,now:Date.now()});
+    if(verified.status!=='verified'){
+      if(verified.reason==='original-unavailable'){say('Gmailの原文が表示されるのを待っています。');return;}
+      say('受信時刻・宛先・大学の署名を照合できませんでした。古い番号は入力しません。公式画面で確認するか、認証を開始し直してください。');actions([['認証を中止',cancel],['この原文タブを閉じる',()=>GM.closeTab()]]);return;
+    }
+    if(!/^\d{6}$/.test(p.code)||!Array.isArray(p.messageIds)||!p.messageIds.includes('data-message-id:#'+p.permMessageId)&&!p.messageIds.includes('data-message-id:'+p.permMessageId))return;
+    const next=await update(j,'ready',{code:p.code,messageIds:p.messageIds,receivedAt:verified.receivedAt,codeCapturedAt:Date.now(),originalPending:null});
+    if(next){say('受信時刻と大学の署名を確認しました。この原文タブを閉じ、CampusSquareへ戻ってください。');actions([['この原文タブを閉じる',()=>GM.closeTab()]]);}
   }
-  async function tick(){config=await GM.getValue(KEY_CONFIG,null);if(document.visibilityState==='hidden')return;if(location.hostname==='mail.google.com')await gmailTick();else await campusTick();}
+  async function openOriginal(j){
+    const p=j.originalPending;if(!p)return;
+    if(openedOriginalId===p.permMessageId){say('原文のタブで受信時刻を確認中です。タブが開かない場合は、このメールの「その他のメッセージ オプション」→「原文を表示」を押してください。');actions([['原文をもう一度開く',async()=>{openedOriginalId=null;originalMenuPending=null;await gmailTick();}],['認証を中止',cancel]]);return;}
+    const element=messageElement(p.messageIds);if(!element){say('選んだ認証メールを開いてください。');return;}
+    if(originalMenuPending&&originalMenuPending.permMessageId===p.permMessageId){
+      const items=Array.from(document.querySelectorAll('[role="menuitem"]')).filter(e=>visible(e)&&!e.closest('.a3s')&&['原文を表示','Show original'].includes(e.textContent.trim()));
+      if(items.length===1){say('「原文を開いて確認」を押してください。受信時刻と大学の署名を読みます。');actions([['原文を開いて確認',()=>{const current=Array.from(document.querySelectorAll('[role="menuitem"]')).filter(e=>visible(e)&&!e.closest('.a3s')&&['原文を表示','Show original'].includes(e.textContent.trim()));if(current.length!==1||!originalMenuPending||originalMenuPending.permMessageId!==p.permMessageId||Date.now()>=j.expiresAt)return;current[0].click();openedOriginalId=p.permMessageId;originalMenuPending=null;say('開いた原文タブで受信時刻と大学の署名を確認します。');actions([]);}]]);return;}
+      if(Date.now()-originalMenuPending.startedAt>10000){originalMenuPending=null;say('原文を開くメニューを確認できません。選んだ認証メールで「原文を表示」を開いてください。');}
+      return;
+    }
+    const buttons=Array.from(element.querySelectorAll('button[aria-label]')).filter(b=>visible(b)&&!b.closest('.a3s')&&['その他のメッセージ オプション','More message options'].includes(b.getAttribute('aria-label')));
+    if(buttons.length!==1){say('この表示では原文を開けません。Safariでデスクトップ用Webサイトを表示してください。');return;}
+    originalMenuPending={permMessageId:p.permMessageId,startedAt:Date.now()};buttons[0].click();
+  }
+  async function gmailTick(){const j=await job();if(j&&j.phase==='ready'){say('新しい認証番号を確認しました。CampusSquareへ戻ると公式フォームに入力・送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);return;}if(j&&j.phase==='prepared'){say('過去メールは確認済みです。CampusSquareへ戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);return;}if(!j||!['prepare','requested'].includes(j.phase)){say('Gmailの連携設定は保存されています。認証はCampusSquareのメール送信画面から開始してください。');actions([]);return;}
+    if(!matchingAccount()){say('設定したGmailアカウントで開いてください。Safariでデスクトップ用Webサイトを表示すると対応画面になります。');actions([]);return;}
+    if(contextURL!==location.href){resetMailContext();contextURL=location.href;}
+    if(j.originalPending){await openOriginal(j);return;}
+    const capture=ChuoGmailDOM.captureOpenThread(document,RULES,{threadKeys:[],forOriginalVerification:true});
+    if(capture.status!=='captured'){
+      const inbox=ChuoGmailDOM.captureInboxCandidates(document,RULES),candidates=inbox.candidates.sort((a,b)=>b.receivedInterval.startMs-a.receivedInterval.startMs);
+      if(candidates.length){const chosen=candidates[0],row=Array.from(document.querySelectorAll('[role="row"]')).find(r=>visible(r)&&Array.from(r.querySelectorAll('[data-thread-id],[data-legacy-thread-id]')).some(e=>['data-thread-id','data-legacy-thread-id'].some(k=>chosen.threadKeys.includes(k+':'+e.getAttribute(k)))));if(row){row.click();say('CampusSquareの認証メールだけを確認しています。');}return;}
+      if(j.phase!=='prepare'){say('認証メールの検索結果を開き、新しいメールが表示されるのを待ってください。');return;}
+    }
+    if(j.phase==='prepare'){const baseline={kind:'chuo-gmail-thread-baseline',version:1,capturedAt:Date.now(),threadKeys:capture.threadKeys||[],identityKeys:capture.identityKeys||[]};if(await update(j,'prepared',{baseline})){say('過去メールを確認しました。CampusSquareのタブに戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);}return;}
+    const found=ChuoGmailDOM.selectOtpCandidate(capture,RULES,{baseline:j.baseline,requestStartedAt:j.requestStartedAt,usedMessageIds:new Set(await GM.getValue(KEY_USED,[])),now:Date.now()});
+    if(found.status!=='candidate'){say(found.status==='manual-required'?'認証メールを一意に確認できません。公式画面で確認してください。':'認証メールの到着を待っています。このGmail画面を前面にしておいてください。');return;}
+    const next=await update(j,'requested',{originalPending:{permMessageId:found.permMessageId,code:found.code,messageIds:found.identityKeys,createdAt:Date.now()}});if(next)await openOriginal(next);
+  }
+  async function tick(){config=await GM.getValue(KEY_CONFIG,null);if(document.visibilityState==='hidden')return;if(location.hostname==='mail.google.com'){if(new URL(location.href).searchParams.get('view')==='om')await originalTick();else await gmailTick();}else await campusTick();}
   const refresh=()=>perform(tick);document.addEventListener('visibilitychange',refresh);window.addEventListener('pageshow',refresh);setInterval(refresh,1500);await refresh();
 })();
 
