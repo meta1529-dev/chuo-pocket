@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#ba1837">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="中大ポケット">
+  <meta name="description" content="時間割、教室、シラバス、課題を自分の端末で管理する中大ポケット。">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+  <title>中大ポケット</title>
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./icon-192.png">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="app-header"><a class="brand" href="#today"><span class="brand-mark" aria-hidden="true">中</span><span>中大ポケット</span></a><button class="icon-button" id="settings-open" aria-label="設定を開く">設定</button></header>
+    <div class="storage-note"><span class="small-dot" aria-hidden="true"></span>この端末に保存 <span id="storage-status" role="status" aria-live="polite">読み込み中</span></div>
+    <div id="storage-alert" class="storage-alert" role="alert" hidden><p id="storage-alert-message"></p><button class="secondary" data-action="retry-storage">保存を再確認</button><button class="secondary" data-action="storage-settings">バックアップ・保存設定</button></div>
+    <main id="main"><div class="empty"><p>保存データを開いています。</p></div></main>
+    <nav class="bottom-nav" aria-label="メインメニュー">
+      <a href="#today" data-view="today">今日</a><a href="#courses" data-view="courses">時間割</a><a href="#tasks" data-view="tasks">課題</a><a href="#pages" data-view="pages">シラバス</a><a href="#import" data-view="import">取り込み</a>
+    </nav>
+  </div>
+  <dialog id="modal"><div id="modal-body"></div></dialog>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <noscript>このアプリを使うにはJavaScriptを有効にしてください。</noscript>
+</body>
+</html>
