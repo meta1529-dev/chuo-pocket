@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Chuo Pocket Login
 // @description  自分のGmailから新しいCampusSquare認証番号を読み、大学公式フォームへ入力する補助
-// @version      1.2.0
+// @version      1.2.1
 // @match        https://portal.cs.chuo-u.ac.jp/campusweb/*
-// @match        https://mail.google.com/mail/u/*
+// @match        https://mail.google.com/mail/*
 // @inject-into  content
 // @run-at       document-end
 // @noframes
@@ -751,22 +751,30 @@ return module.exports;})();
 (async function runChuoLogin() {
   'use strict';
   if (window.top !== window || !['portal.cs.chuo-u.ac.jp','mail.google.com'].includes(location.hostname)) return;
+  if(window.__chuoPocketLoginRuntime){window.__chuoPocketLoginRuntime.mount();return;}
   const KEY_CONFIG='config-v1',KEY_JOB='login-job-v1',KEY_USED='used-mail-ids-v1';
   const RULES={expectedSender:'no-reply@cs.chuo-u.ac.jp',expectedSubject:'【CampusSquare】ワンタイムパスワードのお知らせ'};
   const adapter=ChuoOTPAdapter.createAdapter(ChuoCampusSquareOTPManifest);
   const State=ChuoAuthState;
-  if (typeof GM==='undefined' || !['getValue','setValue','deleteValue','openInTab','getTab','saveTab','closeTab','addStyle'].every(k=>typeof GM[k]==='function')) return;
   async function storage(name,...args){let timer;try{return await Promise.race([GM[name](...args),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('STORAGE_TIMEOUT')),8000);})]);}finally{clearTimeout(timer);}}
   let busy=false,config=null,owner=null,contextNonce=null,contextURL=null,originalMenuPending=null,openedOriginalId=null;
   const userQueue=[],hookedSendButtons=new WeakSet(),nativeSending=new WeakSet();
-  let bootStorageError=false;
-  try{config=await storage('getValue',KEY_CONFIG,null);}catch(_){bootStorageError=true;}
   function resetMailContext(){originalMenuPending=null;openedOriginalId=null;contextURL=null;}
   const panel=document.createElement('section');panel.id='chuo-pocket-login';panel.setAttribute('aria-label','中大ポケットのログイン補助');
-  panel.innerHTML='<strong>中大ポケット <small>v1.2.0</small></strong><p class="cp-config-notice" role="status" hidden></p><p class="cp-status" role="status"></p><div class="cp-actions"></div><details><summary>メール連携の設定</summary><label>認証メールが届くGmailアドレス<input type="email" class="cp-email" autocomplete="email"></label><label>Gmailのアカウント番号<input type="number" class="cp-index" min="0" max="9" value="0"></label><p>GmailのURLが /u/0/ なら0です。大学の認証メールが届く大学配布アドレスを入力してください。</p><button type="button" class="cp-save">設定をこのiPhoneに保存</button><p class="cp-config-result" role="status"></p><button type="button" class="cp-clear">連携設定を消す</button><p>メール本文や大学パスワードは保存しません。</p></details>';
-  document.body.append(panel);
-  try{Promise.resolve(GM.addStyle('#chuo-pocket-login{position:fixed!important;bottom:12px!important;right:12px!important;left:12px!important;z-index:2147483646!important;max-width:420px!important;margin-left:auto!important;padding:14px!important;border:1px solid #aaa!important;border-radius:14px!important;background:#fff!important;color:#20242b!important;box-shadow:0 4px 24px #0003!important;font:14px/1.6 system-ui!important;max-height:48vh!important;overflow:auto!important;box-sizing:border-box!important}#chuo-pocket-login p{margin:6px 0!important}#chuo-pocket-login button{font:inherit!important;border:1px solid #ba1837!important;border-radius:8px!important;background:#ba1837!important;color:#fff!important;padding:8px 10px!important;margin:3px!important;cursor:pointer!important}#chuo-pocket-login label{display:block!important}#chuo-pocket-login input{display:block!important;box-sizing:border-box!important;width:100%!important;border:1px solid #888!important;color:#20242b!important;background:#fff!important;padding:7px!important;font:inherit!important}#chuo-pocket-login details p{font-size:12px!important}')).catch(()=>{});}catch(_){}
+  panel.innerHTML='<strong>中大ポケット <small>v1.2.1</small></strong><p class="cp-config-notice" role="status" hidden></p><p class="cp-status" role="status"></p><div class="cp-actions"></div><details><summary>メール連携の設定</summary><label>認証メールが届くGmailアドレス<input type="email" class="cp-email" autocomplete="email"></label><label>Gmailのアカウント番号<input type="number" class="cp-index" min="0" max="9" value="0"></label><p>GmailのURLが /u/0/ なら0です。大学の認証メールが届く大学配布アドレスを入力してください。</p><button type="button" class="cp-save">設定をこのiPhoneに保存</button><p class="cp-config-result" role="status"></p><button type="button" class="cp-clear">連携設定を消す</button><p>メール本文や大学パスワードは保存しません。</p></details>';
+  const panelCSS='#chuo-pocket-login{display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;bottom:12px!important;right:12px!important;left:12px!important;z-index:2147483647!important;max-width:420px!important;margin-left:auto!important;padding:14px!important;border:1px solid #aaa!important;border-radius:14px!important;background:#fff!important;color:#20242b!important;box-shadow:0 4px 24px #0003!important;font:14px/1.6 system-ui!important;max-height:48vh!important;overflow:auto!important;box-sizing:border-box!important;pointer-events:auto!important}#chuo-pocket-login p{margin:6px 0!important}#chuo-pocket-login button{font:inherit!important;border:1px solid #ba1837!important;border-radius:8px!important;background:#ba1837!important;color:#fff!important;padding:8px 10px!important;margin:3px!important;cursor:pointer!important}#chuo-pocket-login label{display:block!important}#chuo-pocket-login input{display:block!important;box-sizing:border-box!important;width:100%!important;border:1px solid #888!important;color:#20242b!important;background:#fff!important;padding:7px!important;font:inherit!important}#chuo-pocket-login details p{font-size:12px!important}';
+  const panelStyle=document.createElement('style');panelStyle.id='chuo-pocket-login-style';panelStyle.textContent=panelCSS;
+  function mountPanel(){if(typeof document==='undefined'||!document)return;const host=document.body||document.documentElement,styleHost=document.head||document.documentElement;if(host&&panel.parentNode!==host)host.append(panel);if(styleHost&&!panelStyle.isConnected)styleHost.append(panelStyle);}
+  window.__chuoPocketLoginRuntime={mount:mountPanel};mountPanel();
+  new MutationObserver(mountPanel).observe(document,{childList:true,subtree:true});
   const say=t=>{panel.querySelector('.cp-status').textContent=t;};
+  const bootControls=Array.from(panel.querySelectorAll('input,button'));bootControls.forEach(e=>e.disabled=true);
+  if(typeof GM==='undefined'||!['getValue','setValue','deleteValue','openInTab','getTab','saveTab'].every(k=>typeof GM[k]==='function')){say('Userscriptsの保存・タブ連携機能を利用できません。Userscriptsを更新し、このサイトでの実行を許可してから再読み込みしてください。');return;}
+  if(typeof GM.addStyle==='function'){try{Promise.resolve(GM.addStyle(panelCSS)).catch(()=>{});}catch(_){}}
+  say('連携設定を読み込んでいます…');
+  let bootStorageError=false;
+  try{config=await storage('getValue',KEY_CONFIG,null);}catch(_){bootStorageError=true;}
+  bootControls.forEach(e=>e.disabled=false);
   function actions(list){const area=panel.querySelector('.cp-actions');area.replaceChildren();for(const [text,fn,gesture=false]of list){const b=document.createElement('button');b.type='button';b.textContent=text;b.onclick=()=>perform(fn,{gesture});area.append(b);}}
   async function perform(fn,{queue=true,gesture=false}={}){if(busy){if(gesture){say('処理中です。少し待ってから、同じボタンをもう一度押してください。');}else if(queue){userQueue.push(fn);say('操作を受け付けました。処理が終わるまで少しお待ちください。');}return;}busy=true;try{await fn();}catch(_){say('処理を完了できませんでした。設定と公式画面を確認してください。保存した授業データは残っています。');}finally{busy=false;if(userQueue.length)void perform(userQueue.shift());}}
   if(State.validConfig(config)){panel.querySelector('.cp-email').value=config.email;panel.querySelector('.cp-index').value=config.accountIndex;}
@@ -806,6 +814,7 @@ return module.exports;})();
   async function openMail(){if(!State.validConfig(config))return;const query='from:'+RULES.expectedSender+' subject:ワンタイムパスワード';await GM.openInTab('https://mail.google.com/mail/u/'+config.accountIndex+'/#search/'+encodeURIComponent(query),false);}
   function sendStage(){if(location.pathname!=='/campusweb/campussquare.do')return null;const forms=Array.from(document.forms).filter(f=>{const a=new URL(f.getAttribute('action')||location.href,location.href);return (f.method||'').toLowerCase()==='post'&&a.origin===location.origin&&a.pathname===location.pathname&&Array.from(f.querySelectorAll('h3')).some(h=>visible(h)&&h.textContent.trim()==='ワンタイムパスワード認証を行います。')&&f.querySelectorAll('input[type="submit"][name="_eventId_send"][value="送信"]').length===1;});if(forms.length!==1)return null;const form=forms[0],button=form.querySelector('input[type="submit"][name="_eventId_send"]');if(!visible(button)||button.disabled||Array.from(document.querySelectorAll('input[type="password"]')).some(visible)||button.hasAttribute('formaction')||button.hasAttribute('formmethod'))return null;return{form,button};}
   async function openCampus(){await GM.openInTab('https://portal.cs.chuo-u.ac.jp/campusweb/',false);}
+  function closeMailTab(){if(typeof GM.closeTab==='function')return GM.closeTab();say('Safariのタブ一覧でこのGmailタブを閉じ、CampusSquareのタブへ戻ってください。');}
   function armSend(s){if(!s||hookedSendButtons.has(s.button))return;hookedSendButtons.add(s.button);s.button.addEventListener('click',event=>{if(nativeSending.has(s.button)||!State.validConfig(config))return;event.preventDefault();event.stopImmediatePropagation();void perform(start);},true);}
   async function start(){
     const s=sendStage();if(!s||!State.validConfig(config)){say('大学の認証メール送信画面を開き、Gmail設定を保存してください。');return;}
@@ -842,16 +851,16 @@ return module.exports;})();
   function messageElement(ids){const all=Array.from(document.querySelectorAll('[data-message-id], [data-legacy-message-id]'));return all.find(e=>visible(e)&&['data-message-id','data-legacy-message-id'].some(k=>ids.includes(k+':'+e.getAttribute(k))));}
   async function originalTick(){
     const j=await job(),p=j&&j.originalPending;
-    if(j&&j.phase==='ready'){say('受信時刻と大学の署名を確認しました。この原文タブを閉じ、CampusSquareへ戻ってください。');actions([['この原文タブを閉じる',()=>GM.closeTab()]]);return;}
+    if(j&&j.phase==='ready'){say('受信時刻と大学の署名を確認しました。この原文タブを閉じ、CampusSquareへ戻ってください。');actions([['この原文タブを閉じる',closeMailTab]]);return;}
     if(!j||j.phase!=='requested'||!p){say('この原文は進行中の認証と結び付いていません。CampusSquareから開始してください。');actions([]);return;}
     const verified=ChuoGmailOriginal.inspectOriginal(document,location,{expectedEmail:config.email,expectedAccountIndex:config.accountIndex},{expectedPermMessageId:p.permMessageId,requestStartedAt:j.requestStartedAt,now:Date.now()});
     if(verified.status!=='verified'){
       if(verified.reason==='original-unavailable'){say('Gmailの原文が表示されるのを待っています。');return;}
-      say('受信時刻・宛先・大学の署名を照合できませんでした。古い番号は入力しません。公式画面で確認するか、認証を開始し直してください。');actions([['認証を中止',cancel],['この原文タブを閉じる',()=>GM.closeTab()]]);return;
+      say('受信時刻・宛先・大学の署名を照合できませんでした。古い番号は入力しません。公式画面で確認するか、認証を開始し直してください。');actions([['認証を中止',cancel],['この原文タブを閉じる',closeMailTab]]);return;
     }
     if(!/^\d{6}$/.test(p.code)||!Array.isArray(p.messageIds)||!p.messageIds.includes('data-message-id:#'+p.permMessageId)&&!p.messageIds.includes('data-message-id:'+p.permMessageId))return;
     const next=await update(j,'ready',{code:p.code,messageIds:p.messageIds,receivedAt:verified.receivedAt,codeCapturedAt:Date.now(),originalPending:null});
-    if(next){say('受信時刻と大学の署名を確認しました。この原文タブを閉じ、CampusSquareへ戻ってください。');actions([['この原文タブを閉じる',()=>GM.closeTab()]]);}
+    if(next){say('受信時刻と大学の署名を確認しました。この原文タブを閉じ、CampusSquareへ戻ってください。');actions([['この原文タブを閉じる',closeMailTab]]);}
   }
   async function openOriginal(j){
     const p=j.originalPending;if(!p)return;
@@ -867,7 +876,7 @@ return module.exports;})();
     if(buttons.length!==1){say('この表示では原文を開けません。Safariでデスクトップ用Webサイトを表示してください。');return;}
     originalMenuPending={permMessageId:p.permMessageId,startedAt:Date.now()};buttons[0].click();
   }
-  async function gmailTick(){if(!State.validConfig(config)){say('初回だけ、下の欄に認証メールが届くGmailアドレスを入力して保存してください。');actions([]);return;}const j=await job();if(j&&j.phase==='ready'){say('新しい認証番号を確認しました。CampusSquareへ戻ると公式フォームに入力・送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);return;}if(j&&j.phase==='prepared'){say('過去メールは確認済みです。CampusSquareへ戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);return;}if(!j||!['prepare','requested'].includes(j.phase)){say('Gmail設定は保存済みです。CampusSquareで大学の「送信」を押してから、番号の取得へ進んでください。');actions([['CampusSquareで認証メールを送る',openCampus]]);return;}
+  async function gmailTick(){if(!State.validConfig(config)){say('初回だけ、下の欄に認証メールが届くGmailアドレスを入力して保存してください。');actions([]);return;}const j=await job();if(j&&j.phase==='ready'){say('新しい認証番号を確認しました。CampusSquareへ戻ると公式フォームに入力・送信します。');actions([['このGmailタブを閉じて戻る',closeMailTab]]);return;}if(j&&j.phase==='prepared'){say('過去メールは確認済みです。CampusSquareへ戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',closeMailTab]]);return;}if(!j||!['prepare','requested'].includes(j.phase)){say('Gmail設定は保存済みです。CampusSquareで大学の「送信」を押してから、番号の取得へ進んでください。');actions([['CampusSquareで認証メールを送る',openCampus]]);return;}
     if(!matchingAccount()){say('設定したGmailアカウントで開いてください。Safariでデスクトップ用Webサイトを表示すると対応画面になります。');actions([]);return;}
     if(contextURL!==location.href){resetMailContext();contextURL=location.href;}
     if(j.originalPending){await openOriginal(j);return;}
@@ -877,13 +886,13 @@ return module.exports;})();
       if(candidates.length){const chosen=candidates[0],row=Array.from(document.querySelectorAll('[role="row"]')).find(r=>visible(r)&&Array.from(r.querySelectorAll('[data-thread-id],[data-legacy-thread-id]')).some(e=>['data-thread-id','data-legacy-thread-id'].some(k=>chosen.threadKeys.includes(k+':'+e.getAttribute(k)))));if(row){row.click();say('CampusSquareの認証メールだけを確認しています。');}return;}
       if(j.phase!=='prepare'){say('認証メールの検索結果を開き、新しいメールが表示されるのを待ってください。');return;}
     }
-    if(j.phase==='prepare'){const baseline={kind:'chuo-gmail-thread-baseline',version:1,capturedAt:Date.now(),threadKeys:capture.threadKeys||[],identityKeys:capture.identityKeys||[]};if(await update(j,'prepared',{baseline})){say('過去メールを確認しました。CampusSquareのタブに戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',()=>GM.closeTab()]]);}return;}
+    if(j.phase==='prepare'){const baseline={kind:'chuo-gmail-thread-baseline',version:1,capturedAt:Date.now(),threadKeys:capture.threadKeys||[],identityKeys:capture.identityKeys||[]};if(await update(j,'prepared',{baseline})){say('過去メールを確認しました。CampusSquareのタブに戻ると新しい認証メールを送信します。');actions([['このGmailタブを閉じて戻る',closeMailTab]]);}return;}
     const found=ChuoGmailDOM.selectOtpCandidate(capture,RULES,{baseline:j.baseline,requestStartedAt:j.requestStartedAt,usedMessageIds:new Set(await storage('getValue',KEY_USED,[])),now:Date.now()});
     if(found.status!=='candidate'){say(found.status==='manual-required'?'認証メールを一意に確認できません。公式画面で確認してください。':'認証メールの到着を待っています。このGmail画面を前面にしておいてください。');return;}
     const next=await update(j,'requested',{originalPending:{permMessageId:found.permMessageId,code:found.code,messageIds:found.identityKeys,createdAt:Date.now()}});if(next)await openOriginal(next);
   }
-  async function tick(){config=await storage('getValue',KEY_CONFIG,null);if(document.visibilityState==='hidden')return;if(location.hostname==='mail.google.com'){if(new URL(location.href).searchParams.get('view')==='om')await originalTick();else await gmailTick();}else await campusTick();}
-  const refresh=()=>perform(tick,{queue:false});document.addEventListener('visibilitychange',refresh);window.addEventListener('pageshow',refresh);setInterval(refresh,1500);await refresh();
+  async function tick(){mountPanel();config=await storage('getValue',KEY_CONFIG,null);if(document.visibilityState==='hidden')return;if(location.hostname==='mail.google.com'){if(new URL(location.href).searchParams.get('view')==='om')await originalTick();else await gmailTick();}else await campusTick();}
+  const refresh=()=>{mountPanel();return perform(tick,{queue:false});};document.addEventListener('visibilitychange',refresh);window.addEventListener('pageshow',refresh);setInterval(refresh,1500);await refresh();
 })();
 
 })();

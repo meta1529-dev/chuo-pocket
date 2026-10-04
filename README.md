@@ -12,7 +12,15 @@
 
 アプリの「取り込み」から「メール連携の設定」を開きます。iPhoneのSafari拡張機能 [Userscripts](https://apps.apple.com/jp/app/userscripts/id1463298887) に、`chuo-pocket-login.user.js` を一度インストールします。保存先は「このiPhone内」にし、GmailとCampusSquareでの実行を許可します。GmailはSafariの「デスクトップ用Webサイトを表示」で利用します。
 
-すでに導入している場合は、Safariで[ログイン補助スクリプト](https://meta1529-dev.github.io/chuo-pocket/chuo-pocket-login.user.js)を開き、アドレス欄左端のページメニューからUserscriptsを開いて、同名のスクリプトを更新・上書きします。GmailとCampusSquareを再読み込みし、下の「中大ポケット」に **v1.2.0** と表示されることを確認してください。この版では設定の保存結果を表示し、保存後は大学の「送信」から補助を始めます。
+### 補助が表示されないとき・最新版への更新
+
+1. Safariで[最新版のログイン補助スクリプト](https://meta1529-dev.github.io/chuo-pocket/chuo-pocket-login.user.js)を開き、アドレス欄左端のページメニューからUserscriptsを開いて、同名のスクリプトを更新・上書きします。
+2. Gmailのページへ戻り、同じページメニューからUserscriptsを一度開きます。**Enable Injection** と **Chuo Pocket Login** の両方をオンにしてください。スクリプト名を押すとオン・オフが切り替わるため、オンになったら繰り返し押さないでください。[Userscriptsの操作案内](https://github.com/quoid/userscripts#usage)
+3. このサイトの実行許可は **「常に許可」（Always Allow）** にします。Userscriptsの画面を閉じ、Gmailを再読み込みしてください。画面下に **「中大ポケット v1.2.1」** が表示されれば更新完了です。CampusSquareも再読み込みします。
+
+**Chuo Pocket Login が一覧にない場合**は、Userscriptsのフォルダボタンから全スクリプト一覧を確認してください。そこにもなければ、Userscriptsアプリで選んだ保存先にスクリプトが保存されているか確認し、上のリンクから再度追加します。
+
+### 設定してログインする
 
 1. Gmail設定に、大学の認証メールが届く大学配布アドレスを入力します。アカウント番号は、そのGmailをiPhoneのSafariで開いたURLが `/mail/u/0/` なら **0**、`/mail/u/1/` なら **1**です。
 2. 「設定をこのiPhoneに保存」を押し、「設定を保存しました。」の表示を確認します。設定は次回も引き継ぎます。
